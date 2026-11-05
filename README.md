@@ -31,9 +31,11 @@ A C++ console program that emulates how a school Guidance Counseling Office sche
 5. [Getting Started](#getting-started)
 6. [Sample Run](#sample-run)
 7. [Project Structure](#project-structure)
-8. [Limitations](#limitations)
-9. [Future Improvements](#future-improvements)
-10. [AI Use Disclosure](#ai-use-disclosure)
+8. [Source Code](#source-code)
+9. [How to Upload Files](#how-to-upload-files-to-this-repository)
+10. [Limitations](#limitations)
+11. [Future Improvements](#future-improvements)
+12. [AI Use Disclosure](#ai-use-disclosure)
 
 ## Overview
 
@@ -132,25 +134,193 @@ CounselConnect-A-Student-Guidance-Counseling-Scheduling-System/
 └── .gitignore
 ```
 
-## Limitations
+## Source Code
 
-- Console program only; data is kept in memory and lost when the program exits
-- Single user, no login or network
-- Dates are entered as plain `YYYYMMDD` numbers without calendar validation
-- Time zone and holidays are not handled
+Click a file name to expand it. Each block has a copy button in its top-right corner.
 
-## Future Improvements
+<details>
+<summary><b>src/main.cpp</b> (console menu)</summary>
 
-- Save and load appointments from a text file
-- Keep the day list sorted by date so day lookup becomes O(log d)
-- Add reschedule as an atomic cancel-and-rebook
-- Add a student login and a counselor view with blocked periods (lunch, meetings)
-- Add a per-student daily booking limit
+```cpp
+// main.cpp - console menu for CounselConnect: A Student Guidance Counseling Scheduling System
+#include <limits>
+#include <cstdlib>
+#include "scheduler.h"
 
-## AI Use Disclosure
+int readInt(const string& prompt) {
+    int x;
+    cout << prompt;
+    while (!(cin >> x)) {
+        if (cin.eof()) exit(0);
+        cin.clear();
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        cout << "Invalid input. " << prompt;
+    }
+    return x;
+}
 
-[Per the course AI policy, state which AI tool was used, what it was used for, and which parts of the project it affected. Only include this after obtaining the instructor's approval.]
+int main() {
+    Scheduler s;
+    cout << "==============================================\n"
+         << "  CounselConnect\n"
+         << "  A Student Guidance Counseling Scheduling System\n"
+         << "  Office hours: 8:30 AM - 5:30 PM\n"
+         << "==============================================\n";
+    while (true) {
+        cout << "\n1 Book  2 Cancel  3 View day  4 Exit\n";
+        int c = readInt("Choice: ");
+        if (c == 1) {
+            Request r; cout << "Student ID: "; cin >> r.studentId;
+            r.date = readInt("Date (YYYYMMDD): ");
+            r.start = readInt("Start (24h HHMM, e.g. 1030): ");
+            r.start = (r.start / 100) * 60 + r.start % 100;
+            r.duration = readInt("Duration (minutes): ");
+            string err; int id = s.book(r, err);
+            if (id != -1) cout << "Booked. Appointment ID " << id << "\n";
+            else {
+                cout << "Failed: " << err << "\n";
+                if (err.find("Conflicts") != string::npos && readInt("Join waitlist? (1/0): ") == 1) s.addToWaitlist(r);
+            }
+        } else if (c == 2) {
+            cout << (s.cancel(readInt("Appointment ID: ")) ? "Cancelled.\n" : "ID not found.\n");
+        } else if (c == 3) {
+            s.showDay(readInt("Date (YYYYMMDD): "), false);
+        } else if (c == 4) break;
+        else cout << "Invalid choice.\n";
+    }
+}
+```
 
-## Acknowledgments
+</details>
 
-Thanks to [Instructor name] and the [Department name] for guidance throughout the course.
+<details>
+<summary><b>src/scheduler.h</b> (core scheduling logic)</summary>
+
+```cpp
+// scheduler.h - CounselConnect core: sorted daily lists, binary search, linear search, waitlist queue
+#ifndef SCHEDULER_H
+#define SCHEDULER_H
+#include <iostream>
+#include <vector>
+#include <queue>
+#include <string>
+using namespace std;
+
+const int OPEN = 8 * 60 + 30, CLOSE = 17 * 60 + 30, STEP = 30, MAX_DUR = 120;
+
+struct Appointment { int id; string studentId; int date; int start; int end; };
+struct Request { string studentId; int date; int start; int duration; };
+struct Day { int date; vector<Appointment> appts; };   // appts kept sorted by start time
+
+inline string fmt(int m) {
+    int h = m / 60, mm = m % 60, h12 = (h % 12 == 0) ? 12 : h % 12;
+    return to_string(h12) + ":" + (mm < 10 ? "0" : "") + to_string(mm) + (h >= 12 ? " PM" : " AM");
+}
+
+class Scheduler {
+    vector<Day> days;            // dynamic array of day records
+    queue<Request> waitlist;     // FIFO for requests that hit a conflict
+    int nextId = 1;
+
+    // Linear search: find a day record by date. O(d)
+    Day* findDay(int date) {
+        for (Day& d : days) if (d.date == date) return &d;
+        return nullptr;
+    }
+
+    // Binary search: first index whose start >= given start. O(log n)
+    static int lowerBound(const vector<Appointment>& v, int start) {
+        int lo = 0, hi = (int)v.size();
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (v[mid].start < start) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
+public:
+    // Returns appointment ID, or -1 with err set.
+    int book(const Request& r, string& err) {
+        int end = r.start + r.duration;
+        if (r.duration <= 0 || r.duration > MAX_DUR || r.duration % STEP != 0) { err = "Duration must be 30-120 min in 30-min steps."; return -1; }
+        if (r.start % STEP != 0) { err = "Start time must be on a 30-min boundary."; return -1; }
+        if (r.start < OPEN || end > CLOSE) { err = "Session must fit within 8:30 AM - 5:30 PM."; return -1; }
+
+        Day* day = findDay(r.date);
+        if (!day) { days.push_back({r.date, {}}); day = &days.back(); }
+        vector<Appointment>& v = day->appts;
+
+        int pos = lowerBound(v, r.start);
+        // Sorted + non-overlapping, so only the two neighbors need checking.
+        // Overlap rule: NewStart < ExistingEnd AND NewEnd > ExistingStart
+        if (pos > 0 && v[pos - 1].end > r.start) { err = "Conflicts with an earlier booking."; return -1; }
+        if (pos < (int)v.size() && v[pos].start < end) { err = "Conflicts with a later booking."; return -1; }
+
+        Appointment a{nextId++, r.studentId, r.date, r.start, end};
+        v.insert(v.begin() + pos, a);            // keeps the day sorted. O(n) shift
+        return a.id;
+    }
+
+    // Linear search by appointment ID across all days, then erase. O(n)
+    bool cancel(int id) {
+        for (Day& d : days) {
+            for (size_t i = 0; i < d.appts.size(); i++) {
+                if (d.appts[i].id == id) {
+                    d.appts.erase(d.appts.begin() + i);
+                    promoteWaitlist();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void addToWaitlist(const Request& r) { waitlist.push(r); }
+
+    // One FIFO pass: try each waiting request; re-queue the ones that still don't fit.
+    void promoteWaitlist() {
+        int n = (int)waitlist.size();
+        while (n--) {
+            Request r = waitlist.front(); waitlist.pop();
+            string err;
+            int id = book(r, err);
+            if (id != -1) cout << "[Waitlist] " << r.studentId << " booked, ID " << id << "\n";
+            else waitlist.push(r);
+        }
+    }
+
+    void showDay(int date, bool privateView) {
+        Day* d = findDay(date);
+        if (!d || d->appts.empty()) { cout << "No bookings.\n"; return; }
+        for (const Appointment& a : d->appts) {
+            cout << fmt(a.start) << " - " << fmt(a.end) << "  ";
+            if (privateView) cout << "Booked\n";      // students never see other students' details
+            else cout << a.studentId << " (ID " << a.id << ")\n";
+        }
+    }
+};
+
+#endif
+```
+
+</details>
+
+<details>
+<summary><b>src/benchmark.cpp</b> (experimental timing)</summary>
+
+```cpp
+// benchmark.cpp - experimental timing for Section 5 (book and cancel vs. input size n)
+#include <chrono>
+#include "scheduler.h"
+using namespace std::chrono;
+
+int main() {
+    const int sizes[] = {100, 1000, 10000, 100000};
+    const int REPS = 5, OPS = 100;
+    cout << "n,book_ms,cancel_ms\n";
+    for (int n : sizes) {
+        double bookTotal = 0, cancelTotal = 0;
+        for (int rep = 0; rep < REPS; rep++) {
+            Scheduler s;
+            string err;
+            // Preload n
